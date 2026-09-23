@@ -7,7 +7,6 @@ import plotly.express as px
 st.set_page_config(page_title="학교 급식 식재료 비교", layout="wide")
 
 st.title("🏫 학교별 급식 식재료 등장 빈도 비교")
-st.caption("송탄고등학교를 포함하여 여러 학교의 특정 식재료 출현 빈도를 비교합니다.")
 
 # ---------------------------------------------------------
 # API Helper Functions
@@ -21,7 +20,7 @@ def search_school(school_name):
         res = requests.get(url, params=params).json()
         if "schoolInfo" in res:
             return res["schoolInfo"][1]["row"]
-    except:
+    except Exception as e:
         pass
     return []
 
@@ -33,7 +32,7 @@ def get_meal_data(office_code, school_code, start_date, end_date):
         "Type": "json",
         "ATPT_OFCDC_SC_CODE": office_code,
         "SD_SCHUL_CODE": school_code,
-        "MMEAL_SC_CODE": "2",
+        "MMEAL_SC_CODE": "2",  # 중식
         "MLSV_FROM_YMD": start_date,
         "MLSV_TO_YMD": end_date,
         "pSize": 1000,
@@ -43,34 +42,41 @@ def get_meal_data(office_code, school_code, start_date, end_date):
         res = requests.get(url, params=params).json()
         if "mealServiceDietInfo" in res:
             return res["mealServiceDietInfo"][1]["row"]
-    except:
+    except Exception as e:
         pass
     return []
 
-def parse_menu(ddish_nm):
-    """알레르기 번호 및 특수문자 제거"""
-    items = ddish_nm.split("<br/>")
-    cleaned = []
-    for item in items:
-        c = re.sub(r'[\([\#\d\.\)]+', '', item).strip()
-        if c:
-            cleaned.append(c)
-    return cleaned
+def extract_clean_menus(ddish_nm):
+    """
+    급식 메뉴 항목에서 알레르기/원산지 번호 등 특수문자를 제거하고
+    깨끗한 메뉴 이름 리스트로 반환
+    """
+    # <br/> 태그 기준으로 개별 메뉴 분리
+    raw_items = ddish_nm.split("<br/>")
+    clean_items = []
+    
+    for item in raw_items:
+        # 1. 괄호와 숫자, 점, 특수문자 제거 (예: "닭갈비(1.2.5.6)" -> "닭갈비")
+        clean_name = re.sub(r'\([^)]*\)', '', item)  # 괄호 안 전체 제거
+        clean_name = re.sub(r'[0-9\.\*\#]', '', clean_name)  # 남은 숫자/특수문자 제거
+        clean_name = clean_name.strip()
+        
+        if clean_name:
+            clean_items.append(clean_name)
+            
+    return clean_items
 
 # ---------------------------------------------------------
-# UI 구성 및 설정
+# UI 구성
 # ---------------------------------------------------------
-st.sidebar.header("⚙️ 비교 설정")
+st.sidebar.header("⚙️ 검색 및 비교 설정")
 
-# [필수 조건] 송탄고등학교 기본 선택 + 3개 이상 선택 가능
-default_schools = ["송탄고등학교", "평택고등학교", "신한고등학교"]
 selected_schools = st.sidebar.multiselect(
     "비교할 학교 선택 (3개 이상 권장):",
     options=["송탄고등학교", "평택고등학교", "신한고등학교", "비전고등학교", "한광고등학교", "경기고등학교"],
-    default=default_schools
+    default=["송탄고등학교", "평택고등학교", "신한고등학교"]
 )
 
-# 날짜 지정
 col1, col2 = st.sidebar.columns(2)
 with col1:
     s_date = st.date_input("시작일", pd.to_datetime("2024-03-01"))
@@ -80,69 +86,80 @@ with col2:
 str_s_date = s_date.strftime("%Y%m%d")
 str_e_date = e_date.strftime("%Y%m%d")
 
-# 조사할 식재료 입력
-target_keyword = st.sidebar.text_input("조사할 식재료/단어:", value="닭")
+# 원하는 식재료 키워드 입력
+target_keyword = st.sidebar.text_input("찾을 식재료 키워드 (예: 닭, 돼지, 오징어, 두부, 김치)", value="닭").strip()
 
 # ---------------------------------------------------------
-# 데이터 로드 및 분석
+# 식재료 빈도 분석 실행
 # ---------------------------------------------------------
 if len(selected_schools) < 3:
-    st.warning("⚠️ 필수 조건 충족을 위해 **학교를 3개 이상** 선택해 주세요!")
+    st.warning("⚠️ 필수 조건을 위해 학교를 3개 이상 선택해 주세요.")
 
-if selected_schools:
-    result_data = []
+if selected_schools and target_keyword:
+    results = []
 
     for sch_name in selected_schools:
-        info_list = search_school(sch_name)
-        if not info_list:
-            st.error(f"'{sch_name}' 정보를 찾을 수 없습니다.")
+        schools_found = search_school(sch_name)
+        if not schools_found:
+            st.error(f"'{sch_name}' 정보를 찾지 못했습니다.")
             continue
-        
-        info = info_list[0]
+
+        info = schools_found[0]
         off_code = info["ATPT_OFCDC_SC_CODE"]
         sch_code = info["SD_SCHUL_CODE"]
-        
+
+        # 급식 데이터 API 요청
         meals = get_meal_data(off_code, sch_code, str_s_date, str_e_date)
-        
-        total_days = len(meals)
-        hits = 0
-        
+
+        total_days = len(meals)  # 급식이 제공된 총 일수
+        keyword_days = 0         # 식재료가 나온 급식 일수
+        matching_menu_examples = [] # 발견된 메뉴 예시 저장
+
         for m in meals:
-            parsed = parse_menu(m["DDISH_NM"])
-            # 입력한 식재료 키워드가 포함되었는지 확인
-            if any(target_keyword in item for item in parsed):
-                hits += 1
-                
-        rate = round((hits / total_days * 100), 1) if total_days > 0 else 0
-        result_data.append({
+            ddish_nm = m.get("DDISH_NM", "")
+            menu_list = extract_clean_menus(ddish_nm)
+
+            # 검색할 식재료 키워드가 포함된 메뉴 추출
+            found_menus = [menu for menu in menu_list if target_keyword in menu]
+
+            if found_menus:
+                keyword_days += 1
+                matching_menu_examples.extend(found_menus)
+
+        # 출현 비율 계산 (%)
+        hit_rate = round((keyword_days / total_days * 100), 1) if total_days > 0 else 0.0
+
+        results.append({
             "학교명": sch_name,
-            "총 급식일수": total_days,
-            "등장 횟수": hits,
-            "출현 비율(%)": rate
+            "총 급식 제공일": f"{total_days}일",
+            "식재료 출현 일수": f"{keyword_days}일",
+            "출현 비율(%)": hit_rate,
+            "발견된 관련 메뉴 예시": ", ".join(list(set(matching_menu_examples))[:4])  # 중복 제거 후 최대 4개
         })
 
-    if result_data:
-        df = pd.DataFrame(result_data)
-        
-        st.subheader(f"📊 '{target_keyword}' 식재료 출현 빈도 비교")
-        
-        c1, c2 = st.columns([3, 2])
-        
-        with c1:
-            # Plotly 그래프 시각화
-            fig = px.bar(
-                df,
-                x="학교명",
-                y="출현 비율(%)",
-                text="출현 비율(%)",
-                color="학교명",
-                title=f"학교별 '{target_keyword}'(이)가 포함된 메뉴 출현 비율",
-                height=420
-            )
-            fig.update_traces(texttemplate='%{text}%', textposition='outside')
-            fig.update_layout(yaxis_range=[0, max(df["출현 비율(%)"].max() + 15, 10)])
-            st.plotly_chart(fig, use_container_width=True)
-            
-        with c2:
-            st.write("### 📋 비교 표")
-            st.dataframe(df, hide_index=True, use_container_width=True)
+    # ---------------------------------------------------------
+    # 시각화 (Plotly)
+    # ---------------------------------------------------------
+    if results:
+        df = pd.DataFrame(results)
+
+        st.subheader(f"📊 '{target_keyword}' 식재료 등장 빈도 분석 결과")
+
+        # Plotly 막대그래프
+        fig = px.bar(
+            df,
+            x="학교명",
+            y="출현 비율(%)",
+            text="출현 비율(%)",
+            color="학교명",
+            title=f"조회 기간 중 '{target_keyword}' 식재료 제공 비율 (%)",
+            labels={"출현 비율(%)": "제공 비율 (%)"},
+            height=400
+        )
+        fig.update_traces(texttemplate='%{text}%', textposition='outside')
+        fig.update_layout(yaxis_range=[0, max(df["출현 비율(%)"].max() + 15, 10)])
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.write("### 📋 상세 비교 표")
+        st.dataframe(df, hide_index=True, use_container_width=True)
